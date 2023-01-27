@@ -37,14 +37,6 @@
 
 @end
 
-@interface RCTUIManager (SyncUpdates)
-
-- (BOOL)hasEnqueuedUICommands;
-
-- (void)runSyncUIUpdatesWithObserver:(id<RCTUIManagerObserver>)observer;
-
-@end
-
 @interface ComponentUpdate : NSObject
 
 @property (nonnull) NSMutableDictionary *props;
@@ -54,42 +46,6 @@
 @end
 
 @implementation ComponentUpdate
-@end
-
-@implementation RCTUIManager (SyncUpdates)
-
-- (BOOL)hasEnqueuedUICommands
-{
-  // Accessing some private bits of RCTUIManager to provide missing functionality
-  return [[self valueForKey:@"_pendingUIBlocks"] count] > 0;
-}
-
-- (void)runSyncUIUpdatesWithObserver:(id<RCTUIManagerObserver>)observer
-{
-  // before we run uimanager batch complete, we override coordinator observers list
-  // to avoid observers from firing. This is done because we only want the uimanager
-  // related operations to run and not all other operations (including the ones enqueued
-  // by reanimated or native animated modules) from being scheduled. If we were to allow
-  // other modules to execute some logic from this sync uimanager run there is a possibility
-  // that the commands will execute out of order or that we intercept a batch of commands that
-  // those modules may be in a middle of (we verify that batch isn't in progress for uimodule
-  // but can't do the same for all remaining modules)
-
-  // store reference to the observers array
-  id oldObservers = [self.observerCoordinator valueForKey:@"_observers"];
-
-  // temporarily replace observers with a table conatining just nodesmanager (we need
-  // this to capture mounting block)
-  NSHashTable<id<RCTUIManagerObserver>> *soleObserver = [NSHashTable new];
-  [soleObserver addObject:observer];
-  [self.observerCoordinator setValue:soleObserver forKey:@"_observers"];
-
-  // run batch
-  [self batchDidComplete];
-  // restore old observers table
-  [self.observerCoordinator setValue:oldObservers forKey:@"_observers"];
-}
-
 @end
 
 @interface REANodesManager () <RCTUIManagerObserver>
@@ -106,9 +62,7 @@
   BOOL _processingDirectEvent;
   NSMutableArray<REAOnAnimationCallback> *_onAnimationCallbacks;
   NSMutableArray<REANativeAnimationOp> *_operationsInBatch;
-  BOOL _tryRunBatchUpdatesSynchronously;
   REAEventHandler _eventHandler;
-  volatile void (^_mounting)(void);
   NSMutableDictionary<NSNumber *, ComponentUpdate *> *_componentUpdateBuffer;
   volatile atomic_bool _shouldFlushUpdateBuffer;
   NSMutableDictionary<NSNumber *, UIView *> *_viewRegistry;
@@ -229,13 +183,6 @@
   }
 }
 
-- (BOOL)uiManager:(RCTUIManager *)manager performMountingWithBlock:(RCTUIManagerMountingBlock)block
-{
-  RCTAssert(_mounting == nil, @"Mouting block is expected to not be set");
-  _mounting = block;
-  return YES;
-}
-
 - (void)performOperations
 {
   if (_wantRunUpdates) {
@@ -245,42 +192,19 @@
     NSMutableArray<REANativeAnimationOp> *copiedOperationsQueue = _operationsInBatch;
     _operationsInBatch = [NSMutableArray new];
 
-    BOOL trySynchronously = _tryRunBatchUpdatesSynchronously;
-    _tryRunBatchUpdatesSynchronously = NO;
-
     __weak typeof(self) weakSelf = self;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     RCTExecuteOnUIManagerQueue(^{
       __typeof__(self) strongSelf = weakSelf;
       if (strongSelf == nil) {
         return;
-      }
-      BOOL canUpdateSynchronously = trySynchronously && ![strongSelf.uiManager hasEnqueuedUICommands];
-
-      if (!canUpdateSynchronously) {
-        dispatch_semaphore_signal(semaphore);
       }
 
       for (int i = 0; i < copiedOperationsQueue.count; i++) {
         copiedOperationsQueue[i](strongSelf.uiManager);
       }
 
-      if (canUpdateSynchronously) {
-        [strongSelf.uiManager runSyncUIUpdatesWithObserver:self];
-        dispatch_semaphore_signal(semaphore);
-      }
-      // In case canUpdateSynchronously=true we still have to send uiManagerWillPerformMounting event
-      // to observers because some components (e.g. TextInput) update their UIViews only on that event.
       [strongSelf.uiManager setNeedsLayout];
     });
-    if (trySynchronously) {
-      dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-    }
-
-    if (_mounting) {
-      _mounting();
-      _mounting = nil;
-    }
   }
   _wantRunUpdates = NO;
 }
@@ -290,9 +214,6 @@
                             nativeProps:(NSMutableDictionary *)nativeProps
                        trySynchronously:(BOOL)trySync
 {
-  if (trySync) {
-    _tryRunBatchUpdatesSynchronously = YES;
-  }
   [_operationsInBatch addObject:^(RCTUIManager *uiManager) {
     [uiManager updateView:reactTag viewName:viewName props:nativeProps];
   }];
